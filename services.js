@@ -2,6 +2,9 @@
 'use strict';
 // Integration contract only. Not imported or initialized by the offline HTML.
 // Inject an already configured TEST client later. Never pass a service key.
+function grantError(result){
+  const error=Error('VIEWER_CODE_REQUEST_FAILED');error.code=result.error.code==='42501'?'FORBIDDEN':'STORAGE';return error;
+}
 function createSupabaseAuthAdapter(client){
   if(!client || !client.auth || typeof client.rpc!=='function') throw Error('AUTH_ADAPTER_REQUIRED');
   return {
@@ -20,6 +23,32 @@ function createSupabaseAuthAdapter(client){
       const result=await client.rpc('is_site_admin'); // Server uses auth.uid(), never caller's role claim.
       if(result.error) throw Error('APPROVAL_UNVERIFIED');
       return result.data===true;
+    },
+    // Viewer code management. Every RPC re-checks is_site_admin on the server.
+    async issueViewerCode(label,expiresAt){
+      const result=await client.rpc('issue_viewer_code',{p_label:label,p_expires_at:expiresAt});
+      if(result.error) throw grantError(result);
+      const data=result.data||{};
+      if(!/^\d{6}$/.test(String(data.code||''))) throw Error('VIEWER_CODE_REQUEST_FAILED');
+      return data;
+    },
+    async listViewerCodes(){
+      const result=await client.rpc('list_viewer_codes');
+      if(result.error) throw grantError(result);
+      return Array.isArray(result.data)?result.data:[];
+    },
+    async revokeViewerCode(id){
+      const result=await client.rpc('revoke_viewer_code',{p_id:id});
+      if(result.error) throw grantError(result);
+    },
+    async viewerLockStatus(){
+      const result=await client.rpc('viewer_lock_status');
+      if(result.error) throw grantError(result);
+      return result.data||{locked:false,failures:0};
+    },
+    async unlockViewerCodes(){
+      const result=await client.rpc('unlock_viewer_codes');
+      if(result.error) throw grantError(result);
     },
     async signOut(){
       const result=await client.auth.signOut();
@@ -119,16 +148,60 @@ function createSupabasePublicAdapter(client,validateText){
 module.exports={createSupabasePublicAdapter};
 
 },
+"./supabase-viewer-adapter.cjs":function(module,exports,require){
+'use strict';
+// Viewer path: a 6-digit code becomes a short viewing session. No Auth account; the anon key only.
+// The session token lives in memory (and the tab's sessionStorage via the UI); the server re-checks it on every call.
+function createSupabaseViewerAdapter(client,validate){
+  const SESSION=/^[0-9a-f]{64}$/;
+  function denied(){const error=Error('VIEWER_SESSION_DENIED');error.code='FORBIDDEN';return error;}
+  return {
+    async redeem(code){
+      if(!/^\d{6}$/.test(String(code||''))) return {ok:false,reason:'invalid'};
+      const result=await client.rpc('redeem_viewer_code',{p_code:String(code)});
+      if(result.error) throw Error('VIEWER_REDEEM_FAILED');
+      const data=result.data||{};
+      if(data.ok!==true) return {ok:false,reason:['locked','rate_limited','invalid'].indexOf(data.reason)>=0?data.reason:'invalid'};
+      if(!SESSION.test(String(data.session||''))) throw Error('VIEWER_REDEEM_FAILED');
+      return {ok:true,session:data.session,expiresAt:typeof data.expires_at==='string'?data.expires_at:null};
+    },
+    async load(session){
+      if(!SESSION.test(String(session||''))) throw denied();
+      const result=await client.rpc('read_app_state_viewer',{p_session:session});
+      if(result.error){if(result.error.code==='42501') throw denied();throw Error('VIEWER_READ_FAILED');}
+      const row=result.data;
+      if(!row || !row.data) throw Error('STATE_NOT_INITIALIZED');
+      validate(row.data);
+      return JSON.parse(JSON.stringify(row.data));
+    },
+    async status(session){
+      if(!SESSION.test(String(session||''))) return {active:false,expiresAt:null};
+      const result=await client.rpc('viewer_session_status',{p_session:session});
+      if(result.error) throw Error('VIEWER_STATUS_FAILED');
+      const data=result.data||{};
+      return {active:data.active===true,expiresAt:typeof data.expires_at==='string'?data.expires_at:null};
+    },
+    async end(session){
+      if(!SESSION.test(String(session||''))) return;
+      await client.rpc('end_viewer_session',{p_session:session});
+    }
+  };
+}
+module.exports={createSupabaseViewerAdapter};
+
+},
 "./supabase-services.cjs":function(module,exports,require){
 'use strict';
 const {createSupabaseAuthAdapter}=require('./supabase-auth-adapter.cjs');
 const {createSupabaseStateAdapter}=require('./supabase-state-adapter.cjs');
 const {createSupabasePublicAdapter}=require('./supabase-public-adapter.cjs');
+const {createSupabaseViewerAdapter}=require('./supabase-viewer-adapter.cjs');
 // Build/bundle for an approved environment later. No initialization in offline index.html.
 function createSupabaseServices(client,validation){
   const auth=createSupabaseAuthAdapter(client);
   return {auth,state:createSupabaseStateAdapter(client,auth,validation.state),
-    public:createSupabasePublicAdapter(client,validation.publicText)};
+    public:createSupabasePublicAdapter(client,validation.publicText),
+    viewer:createSupabaseViewerAdapter(client,validation.state)};
 }
 module.exports={createSupabaseServices};
 

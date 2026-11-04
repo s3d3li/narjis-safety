@@ -8,7 +8,16 @@
     '/auth/v1/token':['POST'],'/auth/v1/user':['GET'],'/auth/v1/logout':['POST'],
     '/rest/v1/safety_public_sections':['GET'],'/rest/v1/rpc/is_site_admin':['POST'],
     '/rest/v1/rpc/read_app_state':['POST'],'/rest/v1/rpc/save_app_state':['POST'],
-    '/rest/v1/rpc/publish_safety_section':['POST']
+    '/rest/v1/rpc/publish_safety_section':['POST'],
+    '/rest/v1/rpc/redeem_viewer_code':['POST'],
+    '/rest/v1/rpc/read_app_state_viewer':['POST'],
+    '/rest/v1/rpc/viewer_session_status':['POST'],
+    '/rest/v1/rpc/end_viewer_session':['POST'],
+    '/rest/v1/rpc/issue_viewer_code':['POST'],
+    '/rest/v1/rpc/list_viewer_codes':['POST'],
+    '/rest/v1/rpc/revoke_viewer_code':['POST'],
+    '/rest/v1/rpc/viewer_lock_status':['POST'],
+    '/rest/v1/rpc/unlock_viewer_codes':['POST']
   };
   function blocked(){throw Error('PRODUCTION_TRANSPORT_DENIED');}
   Object.defineProperty(window,'fetch',{configurable:false,writable:false,value:function(input,init){

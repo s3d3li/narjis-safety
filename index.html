@@ -350,6 +350,8 @@ table.rt td.actions{white-space:nowrap; width:1%;}
       <button class="btn btn-sm" id="demoSaveBtn" hidden>حفظ الآن</button>
       <button class="btn btn-sm btn-danger" id="demoResetBtn" hidden>مسح الحفظ المحلي</button>
       <button class="btn btn-sm" id="stateReloadBtn" hidden>تحميل أحدث نسخة بعد التعارض</button>
+      <button class="btn btn-ghost" id="grantsBtn" hidden>🔑<span class="lbl-txt"> تصاريح الاطلاع</span></button>
+      <button class="btn btn-ghost" id="viewerBtn" hidden>👁️<span class="lbl-txt"> الاطلاع المؤقت</span></button>
       <button class="btn" id="adminBtn">دخول المشرف</button>
     </div>
   </div>
@@ -602,9 +604,12 @@ var PUBLIC_STORAGE_KEY="safety_demo_public_v1";
 var publishedSections={};
 var publicGateway=null;
 var editVersion=0,savedEditVersion=-1,saveInFlight=null,saveAgain=false,saveConflict=false;
+// Viewer: reads every section through the server's read check; never edits, publishes or exports.
+var viewerMode=false,viewerTimer=null,viewerSession=null,viewerGateway=null;
+function privateView(){ return adminMode || viewerMode; }
 function connectServices(services){
   if(stateLoaded || !services || !services.auth || !services.state || !services.public) throw new Error("يلزم تهيئة المحولات قبل بدء المنصة");
-  authGateway=services.auth;repository=services.state;publicGateway=services.public;
+  authGateway=services.auth;repository=services.state;publicGateway=services.public;viewerGateway=services.viewer||null;
 }
 function publicTextAllowed(text){
   return typeof text==="string" && text.length<=20000 && !/(?:-----BEGIN|\beyJ[A-Za-z0-9_-]+\.|sb_(?:secret|publishable)_|postgres(?:ql)?:\/\/|(?:password|passwd|secret|token|api[_ -]?key)\s*[:=]|[^\s@]+@[^\s@]+\.[^\s@]+|\d[\d ()+-]{8,}\d)/i.test(text);
@@ -632,7 +637,8 @@ async function publishSection(id,text,approved){
   publishedSections=next;
 }
 function revokeAdmin(){
-  authGeneration++;authorization=null;adminMode=false;clearTimeout(saveTimer);
+  authGeneration++;authorization=null;adminMode=false;viewerMode=false;clearTimeout(saveTimer);clearTimeout(viewerTimer);
+  if(viewerSession) clearViewerSession();
   saveAgain=false;saveConflict=false;editVersion++;
   state=defaultState();document.getElementById("modalRoot").innerHTML="";
   document.getElementById("confirmRoot").innerHTML="";render();
@@ -651,6 +657,72 @@ async function enterAdmin(email,password){
     return true;
   }catch(err){if(generation===authGeneration){revokeAdmin();showToast("لم يتم دخول الإدارة؛ المصادقة أو اعتماد المشرف غير متاح",true);}return false;}
 }
+
+function viewerUntil(iso){ return typeof iso==="string" ? iso.slice(0,16).replace("T"," ") : ""; }
+// The viewing session lives in memory only: F5 or closing the tab ends it; the code can be entered again until it expires.
+function clearViewerSession(){
+  var session=viewerSession;viewerSession=null;
+  if(session && viewerGateway) viewerGateway.end(session).catch(function(){});
+}
+// Re-checks the session every minute so expiry or revocation closes the view without a reload.
+function watchViewer(generation){
+  clearTimeout(viewerTimer);
+  viewerTimer=setTimeout(async function(){
+    if(generation!==authGeneration || !viewerMode || !viewerSession) return;
+    var active=false;
+    try{active=(await viewerGateway.status(viewerSession)).active===true;}catch(err){active=false;}
+    if(generation!==authGeneration) return;
+    if(!active){revokeAdmin();showToast("انتهى تصريح الاطلاع أو أُلغي",true);return;}
+    watchViewer(generation);
+  },60000);
+}
+var VIEWER_REASON={locked:"الدخول بالرموز موقوف مؤقتًا بسبب محاولات خاطئة كثيرة؛ تواصلي مع مدير النظام",
+  rate_limited:"محاولات كثيرة؛ انتظري 15 دقيقة ثم حاولي مجددًا",invalid:"الرمز غير صحيح أو منتهي أو ملغى"};
+async function openViewerSession(session,expiresAt,generation){
+  viewerSession=session;authorization={userId:null,approved:false,viewer:true};viewerMode=true;
+  var loaded=await loadState();
+  if(generation!==authGeneration || !viewerMode) return false;
+  state=loaded;render();watchViewer(generation);
+  setSaveStatus("ok","اطلاع فقط"+(expiresAt?" — حتى "+viewerUntil(expiresAt):""));
+  return true;
+}
+async function enterViewer(code){
+  var generation=++authGeneration;
+  try{
+    if(!viewerGateway) throw new Error("الاطلاع المؤقت غير مفعل في هذه النسخة");
+    var result=await viewerGateway.redeem(String(code||"").trim());
+    if(generation!==authGeneration) return false;
+    if(!result.ok){showToast(VIEWER_REASON[result.reason]||VIEWER_REASON.invalid,true);return false;}
+    return await openViewerSession(result.session,result.expiresAt,generation);
+  }catch(err){
+    if(generation===authGeneration){revokeAdmin();showToast("تعذر الدخول بالرمز",true);}
+    return false;
+  }
+}
+var CODE_STATUS={active:"مستخدم",unused:"لم يُستخدم",expired:"منتهي",revoked:"ملغى"};
+function grantExpiry(duration,customDate){
+  var end;
+  if(duration==="custom"){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(customDate||"")) throw new Error("حددي تاريخ انتهاء صالحًا");
+    end=new Date(customDate+"T23:59:59");
+  } else {
+    var days=Number(duration);
+    if([1,7,30].indexOf(days)<0) throw new Error("مدة غير صالحة");
+    end=new Date(Date.now()+days*86400000);
+  }
+  if(!(end.getTime()>Date.now()+300000) || end.getTime()>Date.now()+366*86400000) throw new Error("يجب أن ينتهي التصريح بعد الآن وخلال سنة");
+  return end.toISOString();
+}
+async function issueGrant(label,duration,customDate){
+  requireEditor();
+  var clean=String(label||"").trim();
+  if(!clean || clean.length>80 || /[\u0000-\u001f\u007f]/.test(clean)) throw new Error("اكتبي اسم المستفيد أو جهته (حتى 80 حرفًا)");
+  return authGateway.issueViewerCode(clean,grantExpiry(duration,customDate));
+}
+async function revokeGrant(id){ requireEditor(); await authGateway.revokeViewerCode(id); }
+async function listGrants(){ requireEditor(); return authGateway.listViewerCodes(); }
+async function viewerLock(){ requireEditor(); return authGateway.viewerLockStatus(); }
+async function unlockViewerCodes(){ requireEditor(); await authGateway.unlockViewerCodes(); }
 
 /* Data operations depend only on this adapter contract, never on a remote client. */
 var DEMO_STORAGE_KEY = "safety_demo_v1_synthetic_only";
@@ -841,7 +913,7 @@ function escapeHtml(str){
 function nl2br(str){ return escapeHtml(str).replace(/\n/g,"<br>"); }
 
 function sectionSummary(cfg){
-  if(!adminMode){var text=publishedSections[cfg.id]||"";return {text:text?"محتوى عام منشور":"لا يوجد محتوى عام معتمد",filled:!!text};}
+  if(!privateView()){var text=publishedSections[cfg.id]||"";return {text:text?"محتوى عام منشور":"لا يوجد محتوى عام معتمد",filled:!!text};}
   var d = state.sections[cfg.id];
   if(cfg.kind === "profile"){
     var total = cfg.fields.length, filled = cfg.fields.filter(function(f){return (d.values[f.key]||"").toString().trim();}).length;
@@ -869,8 +941,8 @@ function overallProgress(){
 
 /* Adapter failures never fall back to a remote connection or claim a successful save. */
 async function loadState(){
-  if(!adminMode || !authorization) return Promise.resolve(defaultState());
-  try{storageProblem=null;var loaded=await repository.load();storageRecoveryRequired=false;return loaded;}
+  if(!privateView() || !authorization) return Promise.resolve(defaultState());
+  try{storageProblem=null;var loaded=viewerMode ? await viewerGateway.load(viewerSession) : await repository.load();storageRecoveryRequired=false;return loaded;}
   catch(err){
     if(err.code==="FORBIDDEN"){revokeAdmin();return defaultState();}
     storageProblem="التخزين غير متاح أو الحفظ لا يطابق المخطط";storageRecoveryRequired=true;
@@ -994,6 +1066,9 @@ function renderTop(){
   if(adminMode){
     btn.innerHTML = '🔓<span class="lbl-txt"> خروج المشرف</span>';
     btn.classList.add("btn-amber");
+  } else if(viewerMode){
+    btn.innerHTML = '🔓<span class="lbl-txt"> خروج (اطلاع فقط)</span>';
+    btn.classList.add("btn-amber");
   } else {
     btn.innerHTML = '<span class="lbl-txt"> دخول المشرف</span>';
     btn.classList.remove("btn-amber");
@@ -1001,7 +1076,9 @@ function renderTop(){
   document.getElementById("demoSaveBtn").hidden=!adminMode;
   document.getElementById("demoResetBtn").hidden=!adminMode || repository.kind==="remote";
   document.getElementById("stateReloadBtn").hidden=!adminMode || !saveConflict;
-  document.getElementById("printBtn").hidden=!adminMode;
+  document.getElementById("printBtn").hidden=!privateView();
+  document.getElementById("viewerBtn").hidden=privateView() || !viewerGateway;
+  document.getElementById("grantsBtn").hidden=!adminMode || !authGateway.listViewerCodes;
 }
 
 function render(){
@@ -1018,7 +1095,7 @@ function renderMain(){
     return;
   }
   var cfg = SECTIONS_BY_ID[activeId];
-  if(!adminMode){
+  if(!privateView()){
     main.innerHTML='<div class="section-head"><h2>'+escapeHtml(cfg.title)+'</h2></div><article class="card public-content" tabindex="0">'+
       nl2br(publishedSections[cfg.id]||"لا يوجد محتوى عام معتمد للنشر في هذا القسم بعد.")+'</article><p>المحتوى للقراءة؛ تقليل النسخ لا يمنع التصوير أو الاستخراج.</p>';
     return;
@@ -1035,21 +1112,21 @@ function renderMain(){
   else if(cfg.kind === "team7") body = renderTeam7(cfg);
 
   var intro = cfg.intro ? '<div class="section-intro">'+escapeHtml(cfg.intro)+'</div>' : "";
-  main.innerHTML = head + intro + body + '<div class="card" style="margin-top:18px"><h3>النص المخصص للنشر العام</h3><p>لا تُنشر حقول الإدارة تلقائيًا. راجعي الأسرار والأسماء والهواتف والمرفقات قبل النشر.</p><textarea data-public-text aria-label="النص العام">'+escapeHtml(publishedSections[cfg.id]||"")+'</textarea><label><input type="checkbox" data-public-approved style="width:auto"> أؤكد خلو النص من الأسرار والمعلومات الشخصية غير المصرح بنشرها</label><button class="btn" data-publish>حفظ النص العام</button></div>';
+  main.innerHTML = head + intro + body + (adminMode ? '<div class="card" style="margin-top:18px"><h3>النص المخصص للنشر العام</h3><p>لا تُنشر حقول الإدارة تلقائيًا. راجعي الأسرار والأسماء والهواتف والمرفقات قبل النشر.</p><textarea data-public-text aria-label="النص العام">'+escapeHtml(publishedSections[cfg.id]||"")+'</textarea><label><input type="checkbox" data-public-approved style="width:auto"> أؤكد خلو النص من الأسرار والمعلومات الشخصية غير المصرح بنشرها</label><button class="btn" data-publish>حفظ النص العام</button></div>' : '');
   bindSectionEvents(cfg);
 }
 
 /* ============ RENDER: HOME ============ */
 function renderHome(){
   var schoolName = state.sections[2].values.schoolName || SCHOOL_DEFAULT;
-  var coordName = adminMode ? (state.sections[1].values.name || "").trim() : "";
+  var coordName = privateView() ? (state.sections[1].values.name || "").trim() : "";
   var prog = overallProgress();
   var pct = Math.round((prog.done/prog.total)*100);
   var html = '<div class="home-hero">'+
     (adminMode ? '<button class="hh-export-btn" id="exportDataBtn" title="تنزيل نسخة كاملة من جميع البيانات كملف">⬇️</button>' : '')+
     '<div class="hh-badge"><img src="'+LOGO_FULL+'" alt="شعار المدرسة"></div>'+
     '<div class="hh-text"><h2>مرحبًا بك في منصة الأمن والسلامة</h2><p>'+escapeHtml(schoolName)+' — سجل رقمي منظم حسب فهرس دليل الأمن والسلامة المدرسي.</p>'+
-    (adminMode?'<p class="hh-coord">👤 منسقة الأمن والسلامة: <b>'+(coordName?escapeHtml(coordName):"لم تحدد بعد")+'</b></p>':"")+'</div>'+
+    (privateView()?'<p class="hh-coord">👤 منسقة الأمن والسلامة: <b>'+(coordName?escapeHtml(coordName):"لم تحدد بعد")+'</b></p>':"")+'</div>'+
     '<div class="hh-progress"><div class="hh-progress-num tabnum">'+prog.done+'<span>/'+prog.total+'</span></div>'+
     '<div class="hh-progress-bar"><div class="hh-progress-fill" style="width:'+pct+'%"></div></div>'+
     '<div class="hh-progress-lbl">أقسام تحتوي بيانات</div></div>'+
@@ -1489,6 +1566,67 @@ function openPasswordModal(){
     if(await enterAdmin(email,password)) root.innerHTML="";
   });
 }
+function openViewerModal(){
+  var root=document.getElementById("modalRoot");
+  root.innerHTML='<div class="overlay"><form class="modal sm" data-viewer-form><div class="modal-body"><h3>الاطلاع المؤقت</h3><p>أدخلي الرمز المكوّن من 6 أرقام الذي سلّمه لك مدير النظام. الاطلاع فقط، دون إضافة أو تعديل أو حذف أو نشر.</p><label>رمز الاطلاع<input inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" data-viewer-code required></label></div><div class="modal-foot"><button class="btn" type="button" data-viewer-cancel>إلغاء</button><button class="btn btn-primary" type="submit">دخول</button></div></form></div>';
+  root.querySelector("[data-viewer-cancel]").addEventListener("click",function(){root.innerHTML="";});
+  root.querySelector("[data-viewer-form]").addEventListener("submit",async function(e){
+    e.preventDefault();var input=root.querySelector("[data-viewer-code]"),code=input.value.trim();input.value="";
+    if(await enterViewer(code)) root.innerHTML="";
+  });
+}
+function renderGrantRows(list){
+  if(!list.length) return '<div class="empty-state">لا توجد رموز بعد.</div>';
+  return '<table class="rt"><thead><tr><th>المستفيد</th><th>الحالة</th><th>ينتهي</th><th>آخر دخول</th><th></th></tr></thead><tbody>'+
+    list.map(function(g){
+      var open=g.status==="active" || g.status==="unused";
+      return '<tr><td>'+escapeHtml(g.label)+'</td><td>'+escapeHtml(CODE_STATUS[g.status]||g.status)+(g.session_active?' — جلسة مفتوحة':'')+'</td><td class="tabnum">'+escapeHtml(viewerUntil(g.expires_at))+'</td><td class="tabnum">'+escapeHtml(viewerUntil(g.last_used_at))+'</td><td>'+
+        (open?'<button class="btn btn-danger btn-sm" type="button" data-grant-revoke="'+escapeHtml(g.id)+'" data-grant-label="'+escapeHtml(g.label)+'">إلغاء</button>':'')+'</td></tr>';
+    }).join("")+'</tbody></table>';
+}
+async function openGrantsModal(){
+  requireEditor();
+  var root=document.getElementById("modalRoot");
+  root.innerHTML='<div class="overlay"><div class="modal"><div class="modal-body"><h3>إدارة تصاريح الاطلاع</h3><p>رمز مستقل من 6 أرقام لكل مستفيد. يطّلع على جميع الأقسام دون تعديل، ويتوقف فور انتهاء المدة أو الإلغاء. يظهر الرمز مرة واحدة فقط عند إصداره.</p>'+
+    '<div data-grant-lock></div>'+
+    '<form data-grant-form><label>اسم المستفيد أو جهته<input maxlength="80" data-grant-label-input required></label><label>المدة<select data-grant-duration><option value="1">يوم واحد</option><option value="7">7 أيام</option><option value="30">30 يومًا</option><option value="custom">تاريخ مخصص</option></select></label>'+
+    '<label data-grant-custom-wrap hidden>ينتهي في نهاية يوم<input type="date" data-grant-custom></label><button class="btn btn-primary" type="submit">إصدار رمز</button></form>'+
+    '<div data-grant-issued></div><div data-grant-list>جارٍ التحميل…</div></div><div class="modal-foot"><button class="btn" type="button" data-grant-close>إغلاق</button></div></div></div>';
+  var listEl=root.querySelector("[data-grant-list]"),lockEl=root.querySelector("[data-grant-lock]"),issuedEl=root.querySelector("[data-grant-issued]");
+  async function refresh(){
+    try{
+      var lock=await viewerLock();
+      lockEl.innerHTML=lock.locked?'<div class="card"><p>الدخول بالرموز موقوف بعد '+escapeHtml(lock.failures)+' محاولة خاطئة. تحققي من عدم وجود محاولات تخمين ثم أعيدي التفعيل.</p><button class="btn btn-primary btn-sm" type="button" data-grant-unlock>إعادة تفعيل الدخول بالرموز</button></div>':'';
+      var unlockBtn=lockEl.querySelector("[data-grant-unlock]");
+      if(lock.locked && unlockBtn) unlockBtn.addEventListener("click",async function(){
+        try{await unlockViewerCodes();showToast("أُعيد تفعيل الدخول بالرموز");}catch(err){showToast("تعذرت إعادة التفعيل",true);}
+        refresh();
+      });
+      listEl.innerHTML=renderGrantRows(await listGrants());
+    }catch(err){listEl.innerHTML='<div class="empty-state">تعذر تحميل التصاريح.</div>';if(err.code==="FORBIDDEN")revokeAdmin();return;}
+    Array.prototype.forEach.call(listEl.querySelectorAll("[data-grant-revoke]"),function(btn){
+      btn.addEventListener("click",async function(){
+        if(!await confirmDialog("إلغاء تصريح الاطلاع لـ "+btn.getAttribute("data-grant-label")+"؟ تُغلق جلسته فورًا.","إلغاء التصريح")) return;
+        try{await revokeGrant(btn.getAttribute("data-grant-revoke"));showToast("أُلغي التصريح");}catch(err){showToast("تعذر إلغاء التصريح",true);}
+        refresh();
+      });
+    });
+  }
+  root.querySelector("[data-grant-close]").addEventListener("click",function(){root.innerHTML="";});
+  root.querySelector("[data-grant-duration]").addEventListener("change",function(e){
+    root.querySelector("[data-grant-custom-wrap]").hidden=e.target.value!=="custom";
+  });
+  root.querySelector("[data-grant-form]").addEventListener("submit",async function(e){
+    e.preventDefault();
+    try{
+      var issued=await issueGrant(root.querySelector("[data-grant-label-input]").value,root.querySelector("[data-grant-duration]").value,root.querySelector("[data-grant-custom]").value);
+      root.querySelector("[data-grant-label-input]").value="";
+      issuedEl.innerHTML='<div class="card"><p>رمز '+escapeHtml(issued.label)+' — ينتهي '+escapeHtml(viewerUntil(issued.expires_at))+'</p><p class="tabnum" style="font-size:28px;letter-spacing:6px;margin:6px 0"><b>'+escapeHtml(issued.code)+'</b></p><p>سلّميه للمستفيد مباشرة. لن يظهر مرة أخرى.</p></div>';
+    }catch(err){issuedEl.innerHTML="";showToast(err.message && err.code!=="FORBIDDEN" && err.code!=="STORAGE" ? err.message : "تعذر إصدار الرمز",true);}
+    refresh();
+  });
+  refresh();
+}
 
 /* ============ INIT ============ */
 document.getElementById("navToggle").addEventListener("click", function(){
@@ -1530,10 +1668,14 @@ document.getElementById("adminBtn").addEventListener("click", async function(){
       if(!await doSave()) {showToast("لم يتم الحفظ؛ ابقي في وضع التحرير لمعالجة الخطأ",true);return;}
     }
     revokeAdmin();authGateway.signOut().catch(function(){showToast("تعذر إغلاق جلسة المزود؛ الإدارة المحلية مغلقة",true);});
+  } else if(viewerMode){
+    revokeAdmin();
   } else {
     openPasswordModal();
   }
 });
+document.getElementById("viewerBtn").addEventListener("click", function(){ if(!privateView()) openViewerModal(); });
+document.getElementById("grantsBtn").addEventListener("click", function(){ if(adminMode) openGrantsModal(); });
 document.getElementById("app").addEventListener("click", function(e){
   var btn = e.target.closest("[data-goto]");
   if(!btn) return;
